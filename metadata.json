@@ -1,0 +1,6 @@
+{
+  "name": "Axiom Search",
+  "description": "Privacy-first live web search engine with cited AI answers, category filters, and a monochrome interactive workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
