@@ -6,11 +6,17 @@ import type { UserProfile } from '../types/vault';
 
 interface LockScreenProps {
   user: UserProfile;
+  getClerkToken?: () => Promise<string | null>;
   onUnlock: (vaultKey: CryptoKey, authKey: string) => Promise<void>;
   onLogout: () => void;
 }
 
-export const LockScreen: React.FC<LockScreenProps> = ({ user, onUnlock, onLogout }) => {
+export const LockScreen: React.FC<LockScreenProps> = ({
+  user,
+  getClerkToken,
+  onUnlock,
+  onLogout,
+}) => {
   const [password, setPassword] = useState('');
   const [showPwd, setShowPwd] = useState(false);
   const [unlocking, setUnlocking] = useState(false);
@@ -28,10 +34,14 @@ export const LockScreen: React.FC<LockScreenProps> = ({ user, onUnlock, onLogout
         user.kdfSalt,
         user.kdfIterations
       );
+      const clerkToken = await getClerkToken?.();
       // Verify against backend login so wrong password never unlocks garbage
       const res = await fetch('/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(clerkToken ? { Authorization: `Bearer ${clerkToken}` } : {}),
+        },
         body: JSON.stringify({ email: user.email, authKey }),
       });
       if (!res.ok) {

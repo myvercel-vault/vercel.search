@@ -24,15 +24,25 @@ import type {
 const TOKEN_STORAGE_KEY = 'vercel_vault_session_token';
 const THEME_STORAGE_KEY = 'vercel_vault_dark_mode';
 
-export function App() {
+export function App({
+  onClerkSignOut,
+  getClerkToken,
+}: {
+  onClerkSignOut?: () => Promise<void>;
+  getClerkToken?: () => Promise<string | null>;
+} = {}) {
   const [darkMode, setDarkMode] = useState<boolean>(() => {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
     return saved !== null ? saved === 'true' : true;
   });
 
   const [booting, setBooting] = useState(true);
-  const [screen, setScreen] = useState<'landing' | 'auth' | 'locked' | 'vault'>('landing');
-  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
+  const [screen, setScreen] = useState<'landing' | 'auth' | 'locked' | 'vault'>(() =>
+    new URLSearchParams(window.location.search).has('auth') ? 'auth' : 'landing'
+  );
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>(() =>
+    new URLSearchParams(window.location.search).get('auth') === 'signup' ? 'signup' : 'signin'
+  );
 
   const [token, setToken] = useState<string | null>(() =>
     localStorage.getItem(TOKEN_STORAGE_KEY)
@@ -48,13 +58,28 @@ export function App() {
 
   const idleTimerRef = useRef<number | null>(null);
 
+  const apiFetch = useCallback(
+    async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const headers = new Headers(init.headers);
+      if (import.meta.env.VITE_CLERK_PUBLISHABLE_KEY) {
+        const appSession = headers.get('Authorization')?.replace(/^Bearer\s+/i, '');
+        const clerkToken = await getClerkToken?.();
+        if (appSession) headers.set('X-Vault-Session', appSession);
+        if (clerkToken) headers.set('Authorization', `Bearer ${clerkToken}`);
+        else headers.delete('Authorization');
+      }
+      return fetch(input, { ...init, headers });
+    },
+    [getClerkToken]
+  );
+
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
     localStorage.setItem(THEME_STORAGE_KEY, String(darkMode));
   }, [darkMode]);
 
   const loadVaultData = useCallback(async (sessionToken: string, key: CryptoKey) => {
-    const res = await fetch('/api/vault', {
+    const res = await apiFetch('/api/vault', {
       headers: { Authorization: `Bearer ${sessionToken}` },
     });
     if (!res.ok) {
@@ -65,7 +90,7 @@ export function App() {
     setFolders(data.folders || []);
     setItems(decrypted);
     setAuditLogs(data.auditLogs || []);
-  }, []);
+  }, [apiFetch]);
 
   // Initial session check: if valid token exists in localStorage, show LockScreen (since CryptoKey is never persisted to disk)
   useEffect(() => {
@@ -77,7 +102,7 @@ export function App() {
         return;
       }
       try {
-        const res = await fetch('/api/auth/me', {
+        const res = await apiFetch('/api/auth/me', {
           headers: { Authorization: `Bearer ${savedToken}` },
         });
         if (!res.ok) {
@@ -104,7 +129,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [apiFetch]);
 
   const handleLockVault = useCallback(() => {
     setVaultKey(null);
@@ -139,7 +164,7 @@ export function App() {
   const handleLogout = async () => {
     if (token) {
       try {
-        await fetch('/api/auth/logout', {
+        await apiFetch('/api/auth/logout', {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         });
@@ -155,17 +180,29 @@ export function App() {
     setItems([]);
     setFolders([]);
     setScreen('landing');
+    if (onClerkSignOut) {
+      try {
+        await onClerkSignOut();
+      } catch (error) {
+        console.error('Failed to sign out from Clerk:', error);
+      }
+    }
   };
 
   // 1-Click Instant Demo Account Provisioner
   const handleQuickDemo = async () => {
+    if (import.meta.env.VITE_CLERK_PUBLISHABLE_KEY) {
+      setAuthMode('signup');
+      setScreen('auth');
+      return;
+    }
     setDemoCreating(true);
     try {
       const demoEmail = 'demo@vercelvault.dev';
       const demoPass = 'Vercel-Vault-Demo-2026!';
 
       // Check prelogin first
-      const preRes = await fetch('/api/auth/prelogin', {
+      const preRes = await apiFetch('/api/auth/prelogin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: demoEmail }),
@@ -178,7 +215,7 @@ export function App() {
         preData.kdfIterations
       );
 
-      const loginTry = await fetch('/api/auth/login', {
+      const loginTry = await apiFetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: demoEmail, authKey: existingAuth }),
@@ -207,7 +244,7 @@ export function App() {
       );
       const starterItems = await buildStarterVaultItems(newKey, demoEmail, 'Demo Architect');
 
-      const signupRes = await fetch('/api/auth/signup', {
+      const signupRes = await apiFetch('/api/auth/signup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -254,7 +291,7 @@ export function App() {
     const encryptedData = await encryptVaultPayload(draft.payload, vaultKey);
 
     if (draft.id) {
-      const res = await fetch(`/api/vault/items/${draft.id}`, {
+      const res = await apiFetch(`/api/vault/items/${draft.id}`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -276,7 +313,7 @@ export function App() {
       setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)));
       return updated;
     } else {
-      const res = await fetch('/api/vault/items', {
+      const res = await apiFetch('/api/vault/items', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -304,7 +341,7 @@ export function App() {
   const handleToggleFavorite = async (item: DecryptedVaultItem) => {
     if (!token) return;
     const nextFav = !item.favorite;
-    const res = await fetch(`/api/vault/items/${item.id}`, {
+    const res = await apiFetch(`/api/vault/items/${item.id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -320,7 +357,7 @@ export function App() {
   const handleMoveToTrash = async (item: DecryptedVaultItem) => {
     if (!token) return;
     const deletedAt = new Date().toISOString();
-    const res = await fetch(`/api/vault/items/${item.id}`, {
+    const res = await apiFetch(`/api/vault/items/${item.id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -335,7 +372,7 @@ export function App() {
 
   const handleRestoreFromTrash = async (item: DecryptedVaultItem) => {
     if (!token) return;
-    const res = await fetch(`/api/vault/items/${item.id}`, {
+    const res = await apiFetch(`/api/vault/items/${item.id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -350,7 +387,7 @@ export function App() {
 
   const handlePermanentDelete = async (item: DecryptedVaultItem) => {
     if (!token) return;
-    const res = await fetch(`/api/vault/items/${item.id}`, {
+    const res = await apiFetch(`/api/vault/items/${item.id}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -361,7 +398,7 @@ export function App() {
 
   const handleEmptyTrash = async () => {
     if (!token) return;
-    const res = await fetch('/api/vault/trash', {
+    const res = await apiFetch('/api/vault/trash', {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -372,7 +409,7 @@ export function App() {
 
   const handleCreateFolder = async (name: string) => {
     if (!token) return;
-    const res = await fetch('/api/vault/folders', {
+    const res = await apiFetch('/api/vault/folders', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -388,7 +425,7 @@ export function App() {
 
   const handleDeleteFolder = async (folderId: string) => {
     if (!token) return;
-    const res = await fetch(`/api/vault/folders/${folderId}`, {
+    const res = await apiFetch(`/api/vault/folders/${folderId}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -406,7 +443,7 @@ export function App() {
     autoLockMinutes?: number;
   }) => {
     if (!token) return;
-    const res = await fetch('/api/auth/settings', {
+    const res = await apiFetch('/api/auth/settings', {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -504,7 +541,7 @@ export function App() {
       throw new Error('Format JSON tidak dikenali.');
     }
 
-    const res = await fetch('/api/vault/items/bulk', {
+    const res = await apiFetch('/api/vault/items/bulk', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -557,6 +594,7 @@ export function App() {
     return (
       <LockScreen
         user={user}
+        getClerkToken={getClerkToken}
         onUnlock={async (derivedVaultKey, derivedAuthKey) => {
           setVaultKey(derivedVaultKey);
           setAuthKey(derivedAuthKey);

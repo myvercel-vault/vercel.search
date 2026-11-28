@@ -3,8 +3,11 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { AsyncLocalStorage } from 'async_hooks';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
+import { clerkClient, clerkMiddleware, getAuth } from '@clerk/express';
+import { Pool, type PoolClient } from 'pg';
 
 dotenv.config();
 
@@ -13,9 +16,18 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const DATA_DIR = path.resolve(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'prism-vault-db.json');
+const pool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL })
+  : null;
+const requestDatabase = new AsyncLocalStorage<{
+  client: PoolClient;
+  db: DatabaseSchema;
+  finished: boolean;
+}>();
 
 interface StoredUser {
   id: string;
+  clerkUserId?: string;
   email: string;
   name: string;
   passwordHint?: string;
@@ -86,6 +98,8 @@ function ensureDataDir(): void {
 }
 
 function loadDb(): DatabaseSchema {
+  const request = requestDatabase.getStore();
+  if (request) return request.db;
   ensureDataDir();
   if (!fs.existsSync(DB_FILE)) {
     const initial: DatabaseSchema = {
@@ -113,11 +127,46 @@ function loadDb(): DatabaseSchema {
   }
 }
 
-function saveDb(db: DatabaseSchema): void {
+async function saveDb(db: DatabaseSchema): Promise<void> {
+  const request = requestDatabase.getStore();
+  if (request) {
+    await request.client.query('UPDATE vault_state SET data = $1::jsonb WHERE id = 1', [
+      JSON.stringify(db),
+    ]);
+    await request.client.query('COMMIT');
+    request.finished = true;
+    request.client.release();
+    return;
+  }
   ensureDataDir();
   const tmpFile = `${DB_FILE}.tmp`;
   fs.writeFileSync(tmpFile, JSON.stringify(db, null, 2), 'utf-8');
   fs.renameSync(tmpFile, DB_FILE);
+}
+
+function asyncRoute(
+  handler: (req: express.Request, res: express.Response, next: express.NextFunction) => unknown
+): express.RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+function clerkUserIdFor(req: express.Request): string | null {
+  if (!process.env.CLERK_SECRET_KEY) return null;
+  const auth = getAuth(req);
+  return auth.isAuthenticated ? auth.userId : null;
+}
+
+function normalizeDatabase(value: unknown): DatabaseSchema {
+  const parsed = (typeof value === 'string' ? JSON.parse(value) : value) as Partial<DatabaseSchema>;
+  return {
+    users: Array.isArray(parsed.users) ? parsed.users : [],
+    sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
+    folders: Array.isArray(parsed.folders) ? parsed.folders : [],
+    items: Array.isArray(parsed.items) ? parsed.items : [],
+    auditLogs: Array.isArray(parsed.auditLogs) ? parsed.auditLogs : [],
+  };
 }
 
 function hashSecret(secret: string, saltHex: string): string {
@@ -184,8 +233,77 @@ function recordAudit(
 }
 
 async function startServer() {
+  if (process.env.NODE_ENV === 'production') {
+    const requiredEnv = ['DATABASE_URL', 'CLERK_SECRET_KEY', 'VITE_CLERK_PUBLISHABLE_KEY'];
+    const missingEnv = requiredEnv.filter((key) => !process.env[key]);
+    if (missingEnv.length > 0) {
+      throw new Error(`Missing required production environment variables: ${missingEnv.join(', ')}`);
+    }
+  }
+
+  if (pool) {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vault_state (
+        id SMALLINT PRIMARY KEY CHECK (id = 1),
+        data JSONB NOT NULL
+      )
+    `);
+    await pool.query(
+      `INSERT INTO vault_state (id, data)
+       VALUES (1, '{"users":[],"sessions":[],"folders":[],"items":[],"auditLogs":[]}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`
+    );
+  }
+
   const app = express();
+  if (process.env.CLERK_SECRET_KEY) {
+    app.use(clerkMiddleware());
+  }
   app.use(express.json({ limit: '4mb' }));
+  app.use(
+    '/api',
+    asyncRoute(async (req, res, next) => {
+      if (!pool) {
+        next();
+        return;
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await client.query('SELECT data FROM vault_state WHERE id = 1 FOR UPDATE');
+        if (!result.rows[0]) throw new Error('Neon vault_state row is missing.');
+        const request = {
+          client,
+          db: normalizeDatabase(result.rows[0].data),
+          finished: false,
+        };
+        const finishRequest = () => {
+          if (request.finished) return;
+          request.finished = true;
+          void client
+            .query('COMMIT')
+            .catch((error: unknown) => console.error('Failed to commit Neon request:', error))
+            .finally(() => client.release());
+        };
+        const abortRequest = () => {
+          if (request.finished) return;
+          request.finished = true;
+          void client
+            .query('ROLLBACK')
+            .catch((error: unknown) => console.error('Failed to roll back Neon request:', error))
+            .finally(() => client.release());
+        };
+        res.once('finish', finishRequest);
+        res.once('close', abortRequest);
+        requestDatabase.run(request, () => next());
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        client.release();
+        next(error);
+      }
+    })
+  );
 
   // Simple rate limiter for auth routes
   const authAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -203,7 +321,12 @@ async function startServer() {
 
   function authenticate(req: express.Request): { db: DatabaseSchema; user: StoredUser; token: string } | null {
     const authHeader = req.headers.authorization || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const vaultSessionHeader = req.headers['x-vault-session'];
+    const token = process.env.CLERK_SECRET_KEY
+      ? (Array.isArray(vaultSessionHeader) ? vaultSessionHeader[0] : vaultSessionHeader) || ''
+      : authHeader.startsWith('Bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
     if (!token) return null;
     const db = loadDb();
     const now = new Date().toISOString();
@@ -211,6 +334,8 @@ async function startServer() {
     if (!session) return null;
     const user = db.users.find((u) => u.id === session.userId);
     if (!user) return null;
+    const clerkUserId = clerkUserIdFor(req);
+    if (process.env.CLERK_SECRET_KEY && (!clerkUserId || user.clerkUserId !== clerkUserId)) return null;
     return { db, user, token };
   }
 
@@ -225,18 +350,31 @@ async function startServer() {
 
   // Pre-login salt lookup so client can derive separate Auth Key & Vault Encryption Key
   app.post('/api/auth/prelogin', (req, res) => {
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    if (!email || !email.includes('@')) {
-      res.status(400).json({ error: 'Valid email address is required.' });
+    const db = loadDb();
+    const clerkUserId = clerkUserIdFor(req);
+    if (process.env.CLERK_SECRET_KEY && !clerkUserId) {
+      res.status(401).json({ error: 'Sign in with Clerk before opening your vault.' });
       return;
     }
-    const db = loadDb();
-    const existing = db.users.find((u) => u.email === email);
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const existing = clerkUserId
+      ? db.users.find((u) => u.clerkUserId === clerkUserId)
+      : db.users.find((u) => u.email === email);
     if (existing) {
       res.json({
+        exists: true,
+        email: existing.email,
         kdfSalt: existing.kdfSalt,
         kdfIterations: existing.kdfIterations,
       });
+      return;
+    }
+    if (clerkUserId) {
+      res.json({ exists: false });
+      return;
+    }
+    if (!email || !email.includes('@')) {
+      res.status(400).json({ error: 'Valid email address is required.' });
       return;
     }
     // Deterministic pseudo-salt so non-existent emails are indistinguishable
@@ -246,21 +384,39 @@ async function startServer() {
       .digest('hex')
       .slice(0, 32);
     res.json({
+      exists: false,
       kdfSalt: fakeSalt,
       kdfIterations: 310000,
     });
   });
 
   // Sign Up with Email + Master Password (client sends authVerifier derived via PBKDF2, or raw fallback)
-  app.post('/api/auth/signup', (req, res) => {
+  app.post('/api/auth/signup', asyncRoute(async (req, res) => {
     const ip = req.ip || '127.0.0.1';
     if (!checkRateLimit(ip)) {
       res.status(429).json({ error: 'Too many attempts. Please wait a minute.' });
       return;
     }
 
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    const name = String(req.body?.name || '').trim().slice(0, 80);
+    let email = String(req.body?.email || '').trim().toLowerCase();
+    let name = String(req.body?.name || '').trim().slice(0, 80);
+    const clerkUserId = clerkUserIdFor(req);
+    if (process.env.CLERK_SECRET_KEY) {
+      if (!clerkUserId) {
+        res.status(401).json({ error: 'Sign in with Clerk before creating a vault.' });
+        return;
+      }
+      const clerkUser = await clerkClient.users.getUser(clerkUserId);
+      const primaryEmail = clerkUser.emailAddresses.find(
+        (address) => address.id === clerkUser.primaryEmailAddressId
+      );
+      if (!primaryEmail || primaryEmail.verification?.status !== 'verified') {
+        res.status(403).json({ error: 'Verify your email address with Clerk before continuing.' });
+        return;
+      }
+      email = primaryEmail.emailAddress.trim().toLowerCase();
+      name = [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join(' ').slice(0, 80) || email.split('@')[0];
+    }
     const authKey = String(req.body?.authKey || '');
     const kdfSalt = String(req.body?.kdfSalt || '').trim();
     const kdfIterations = Number(req.body?.kdfIterations || 310000);
@@ -282,7 +438,7 @@ async function startServer() {
     }
 
     const db = loadDb();
-    if (db.users.some((u) => u.email === email)) {
+    if (db.users.some((u) => u.email === email || (clerkUserId && u.clerkUserId === clerkUserId))) {
       res.status(409).json({ error: 'Akaun dengan emel ini sudah wujud. Sila Sign In.' });
       return;
     }
@@ -298,6 +454,7 @@ async function startServer() {
 
     const newUser: StoredUser = {
       id: userId,
+      clerkUserId: clerkUserId || undefined,
       email,
       name: name || email.split('@')[0],
       passwordHint,
@@ -367,17 +524,17 @@ async function startServer() {
     });
 
     recordAudit(db, userId, 'ACCOUNT_CREATED', `Vault dicipta untuk ${email}`, ip);
-    saveDb(db);
+    await saveDb(db);
 
     res.status(201).json({
       token,
       user: sanitizeUser(newUser),
       recoveryKey,
     });
-  });
+  }));
 
   // Sign In with Email + Master Password
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', asyncRoute(async (req, res) => {
     const ip = req.ip || '127.0.0.1';
     if (!checkRateLimit(ip)) {
       res.status(429).json({ error: 'Terlalu banyak percubaan log masuk. Sila cuba sebentar lagi.' });
@@ -393,7 +550,14 @@ async function startServer() {
     }
 
     const db = loadDb();
-    const user = db.users.find((u) => u.email === email);
+    const clerkUserId = clerkUserIdFor(req);
+    if (process.env.CLERK_SECRET_KEY && !clerkUserId) {
+      res.status(401).json({ error: 'Sign in with Clerk before unlocking your vault.' });
+      return;
+    }
+    const user = clerkUserId
+      ? db.users.find((u) => u.clerkUserId === clerkUserId)
+      : db.users.find((u) => u.email === email);
     if (!user || !verifySecret(authKey, user.authSalt, user.authHash)) {
       res.status(401).json({ error: 'Emel atau Master Password tidak tepat.' });
       return;
@@ -416,19 +580,26 @@ async function startServer() {
     });
 
     recordAudit(db, user.id, 'VAULT_LOGIN', 'Log masuk berjaya menggunakan Master Password', ip);
-    saveDb(db);
+    await saveDb(db);
 
     res.json({
       token,
       user: sanitizeUser(user),
     });
-  });
+  }));
 
   // Password Hint lookup
   app.post('/api/auth/hint', (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const db = loadDb();
-    const user = db.users.find((u) => u.email === email);
+    const clerkUserId = clerkUserIdFor(req);
+    if (process.env.CLERK_SECRET_KEY && !clerkUserId) {
+      res.status(401).json({ error: 'Sign in with Clerk first.' });
+      return;
+    }
+    const user = clerkUserId
+      ? db.users.find((u) => u.clerkUserId === clerkUserId)
+      : db.users.find((u) => u.email === email);
     if (!user || !user.passwordHint) {
       res.json({ hint: 'Tiada pembayang (hint) ditetapkan untuk akaun ini.' });
       return;
@@ -445,17 +616,17 @@ async function startServer() {
     res.json({ user: sanitizeUser(ctx.user) });
   });
 
-  app.post('/api/auth/logout', (req, res) => {
+  app.post('/api/auth/logout', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (ctx) {
       ctx.db.sessions = ctx.db.sessions.filter((s) => s.token !== ctx.token);
       recordAudit(ctx.db, ctx.user.id, 'VAULT_LOGOUT', 'Sesi ditamatkan oleh pengguna', req.ip || '127.0.0.1');
-      saveDb(ctx.db);
+      await saveDb(ctx.db);
     }
     res.json({ ok: true });
-  });
+  }));
 
-  app.patch('/api/auth/settings', (req, res) => {
+  app.patch('/api/auth/settings', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -472,9 +643,9 @@ async function startServer() {
       ctx.user.autoLockMinutes = autoLockMinutes;
     }
     recordAudit(ctx.db, ctx.user.id, 'SETTINGS_UPDATED', 'Tetapan profil & keselamatan dikemaskini', req.ip || '127.0.0.1');
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.json({ user: sanitizeUser(ctx.user) });
-  });
+  }));
 
   // Full Vault Sync (items + folders + auditLogs)
   app.get('/api/vault', (req, res) => {
@@ -493,7 +664,7 @@ async function startServer() {
   });
 
   // Create Folder
-  app.post('/api/vault/folders', (req, res) => {
+  app.post('/api/vault/folders', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -512,12 +683,12 @@ async function startServer() {
     };
     ctx.db.folders.push(folder);
     recordAudit(ctx.db, ctx.user.id, 'FOLDER_CREATED', `Folder "${name}" dicipta`, req.ip || '127.0.0.1');
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.status(201).json({ folder });
-  });
+  }));
 
   // Delete Folder
-  app.delete('/api/vault/folders/:id', (req, res) => {
+  app.delete('/api/vault/folders/:id', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -537,12 +708,12 @@ async function startServer() {
       }
     }
     recordAudit(ctx.db, ctx.user.id, 'FOLDER_DELETED', `Folder "${removed.name}" dipadam`, req.ip || '127.0.0.1');
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.json({ ok: true });
-  });
+  }));
 
   // Create Vault Item
-  app.post('/api/vault/items', (req, res) => {
+  app.post('/api/vault/items', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -580,12 +751,12 @@ async function startServer() {
 
     ctx.db.items.unshift(item);
     recordAudit(ctx.db, ctx.user.id, 'ITEM_CREATED', `Item ${type.toUpperCase()} "${title}" ditambah`, req.ip || '127.0.0.1');
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.status(201).json({ item });
-  });
+  }));
 
   // Bulk Import Vault Items
-  app.post('/api/vault/items/bulk', (req, res) => {
+  app.post('/api/vault/items/bulk', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -619,12 +790,12 @@ async function startServer() {
       created.push(item);
     }
     recordAudit(ctx.db, ctx.user.id, 'VAULT_IMPORT', `${created.length} item diimport ke dalam vault`, req.ip || '127.0.0.1');
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.status(201).json({ items: created });
-  });
+  }));
 
   // Update Vault Item (edit, favorite toggle, trash/restore)
-  app.put('/api/vault/items/:id', (req, res) => {
+  app.put('/api/vault/items/:id', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -661,12 +832,12 @@ async function startServer() {
       item.deletedAt = body.deletedAt ? String(body.deletedAt) : null;
     }
     item.updatedAt = new Date().toISOString();
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.json({ item });
-  });
+  }));
 
   // Permanently delete Vault Item
-  app.delete('/api/vault/items/:id', (req, res) => {
+  app.delete('/api/vault/items/:id', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -680,12 +851,12 @@ async function startServer() {
     const removed = ctx.db.items[idx];
     ctx.db.items.splice(idx, 1);
     recordAudit(ctx.db, ctx.user.id, 'ITEM_PURGED', `Item "${removed.title}" dipadam secara kekal`, req.ip || '127.0.0.1');
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.json({ ok: true });
-  });
+  }));
 
   // Empty Trash
-  app.delete('/api/vault/trash', (req, res) => {
+  app.delete('/api/vault/trash', asyncRoute(async (req, res) => {
     const ctx = authenticate(req);
     if (!ctx) {
       res.status(401).json({ error: 'Unauthorized' });
@@ -695,9 +866,9 @@ async function startServer() {
     ctx.db.items = ctx.db.items.filter((i) => !(i.userId === ctx.user.id && i.deletedAt !== null));
     const count = before - ctx.db.items.length;
     recordAudit(ctx.db, ctx.user.id, 'TRASH_EMPTIED', `${count} item dalam Trash dipadam kekal`, req.ip || '127.0.0.1');
-    saveDb(ctx.db);
+    await saveDb(ctx.db);
     res.json({ purged: count });
-  });
+  }));
 
   // Vite middleware in dev or static files in prod
   const distPath = path.resolve(__dirname, 'dist');

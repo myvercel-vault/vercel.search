@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
+import { SignIn, SignUp, useAuth, useUser } from '@clerk/react';
 import {
   Eye,
   EyeOff,
@@ -36,10 +37,70 @@ interface AuthViewProps {
   }) => void;
 }
 
-export const AuthView: React.FC<AuthViewProps> = ({
+interface ClerkIdentity {
+  email: string;
+  name: string;
+}
+
+interface LegacyAuthViewProps extends AuthViewProps {
+  clerkIdentity?: ClerkIdentity;
+  getClerkToken?: () => Promise<string | null>;
+}
+
+const clerkConfigured = Boolean(import.meta.env.VITE_CLERK_PUBLISHABLE_KEY);
+
+export const AuthView: React.FC<AuthViewProps> = (props) =>
+  clerkConfigured ? <ClerkAuthView {...props} /> : <LegacyAuthView {...props} />;
+
+const ClerkAuthView: React.FC<AuthViewProps> = (props) => {
+  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const { user } = useUser();
+
+  if (!isLoaded) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-white text-black dark:bg-black dark:text-white">
+        <Loader2 className="w-5 h-5 animate-spin" />
+      </div>
+    );
+  }
+
+  if (!isSignedIn || !user) {
+    const identityCard = (
+      <div className="min-h-screen bg-white text-black dark:bg-black dark:text-white flex flex-col items-center justify-center px-4 py-10">
+        <div className="w-full max-w-md mb-4 flex justify-between text-sm">
+          <button type="button" onClick={props.onBackToLanding} className="text-neutral-500 hover:text-black dark:hover:text-white">
+            Kembali
+          </button>
+          <span className="font-semibold">VERCEL VAULT</span>
+        </div>
+        {props.initialMode === 'signup' ? (
+          <SignUp routing="hash" signInUrl="/?auth=signin" />
+        ) : (
+          <SignIn routing="hash" signUpUrl="/?auth=signup" />
+        )}
+      </div>
+    );
+    return identityCard;
+  }
+
+  const email = user.primaryEmailAddress?.emailAddress || '';
+  const name = user.fullName || user.firstName || email.split('@')[0];
+
+  return (
+    <LegacyAuthView
+      {...props}
+      clerkIdentity={{ email, name }}
+      getClerkToken={getToken}
+    />
+  );
+};
+
+const LegacyAuthView: React.FC<LegacyAuthViewProps> = ({
   initialMode,
   onBackToLanding,
   onAuthSuccess,
+  clerkIdentity,
+  getClerkToken,
 }) => {
   const [mode, setMode] = useState<'signin' | 'signup'>(initialMode);
   const [name, setName] = useState('');
@@ -64,6 +125,45 @@ export const AuthView: React.FC<AuthViewProps> = ({
   const [copiedRecovery, setCopiedRecovery] = useState(false);
 
   const strength = evaluatePasswordStrength(password);
+
+  useEffect(() => {
+    if (!clerkIdentity) return;
+    const identityEmail = clerkIdentity.email;
+    setEmail(identityEmail);
+    setName(clerkIdentity.name);
+    let cancelled = false;
+    async function checkVault() {
+      try {
+        const token = await getClerkToken?.();
+        if (!token) return;
+        const res = await fetch('/api/auth/prelogin', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ email: identityEmail }),
+        });
+        if (!res.ok) throw new Error('Gagal menyemak akaun vault.');
+        const data = await res.json();
+        if (!cancelled) {
+          setMode(data.exists ? 'signin' : 'signup');
+          if (data.exists && typeof data.email === 'string') setEmail(data.email);
+        }
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Gagal menyemak akaun vault.');
+      }
+    }
+    checkVault();
+    return () => {
+      cancelled = true;
+    };
+  }, [clerkIdentity?.email, clerkIdentity?.name, getClerkToken]);
+
+  const clerkHeaders = async (): Promise<Record<string, string>> => {
+    const token = await getClerkToken?.();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  };
 
   const handleSuggestMasterPassword = () => {
     const phrase = generateSecret({
@@ -93,7 +193,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
     try {
       const res = await fetch('/api/auth/hint', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(await clerkHeaders()) },
         body: JSON.stringify({ email: email.trim().toLowerCase() }),
       });
       const data = await res.json();
@@ -158,7 +258,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
         setStatusStep('Mendaftarkan Zero-Knowledge Vault...');
         const res = await fetch('/api/auth/signup', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...(await clerkHeaders()) },
           body: JSON.stringify({
             email: normalizedEmail,
             name: name.trim() || normalizedEmail.split('@')[0],
@@ -196,18 +296,24 @@ export const AuthView: React.FC<AuthViewProps> = ({
         setStatusStep('Mendapatkan parameter KDF akaun...');
         const preRes = await fetch('/api/auth/prelogin', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...(await clerkHeaders()) },
           body: JSON.stringify({ email: normalizedEmail }),
         });
         const preData = await preRes.json();
         if (!preRes.ok) {
           throw new Error(preData.error || 'Ralat pra-log masuk.');
         }
+        if (!preData.exists && clerkIdentity) {
+          setMode('signup');
+          throw new Error('Akaun vault belum disediakan. Cipta Master Password dahulu.');
+        }
 
         setStatusStep('Menyahkunci kunci kriptografi tempatan...');
+        const derivationEmail =
+          clerkIdentity && typeof preData.email === 'string' ? preData.email : normalizedEmail;
         const { vaultKey, authKey } = await deriveMasterKeys(
           password,
-          normalizedEmail,
+          derivationEmail,
           preData.kdfSalt,
           preData.kdfIterations
         );
@@ -215,7 +321,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
         setStatusStep('Mengesahkan sesi dengan pelayan...');
         const loginRes = await fetch('/api/auth/login', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...(await clerkHeaders()) },
           body: JSON.stringify({
             email: normalizedEmail,
             authKey,
@@ -330,17 +436,21 @@ export const AuthView: React.FC<AuthViewProps> = ({
           <span>VERCEL VAULT</span>
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            setMode(mode === 'signin' ? 'signup' : 'signin');
-            setError('');
-            setHintMessage('');
-          }}
-          className="text-sm font-medium text-neutral-700 dark:text-neutral-300 hover:underline cursor-pointer"
-        >
-          {mode === 'signin' ? 'Daftar Akaun' : 'Log Masuk'}
-        </button>
+        {clerkIdentity ? (
+          <span className="text-xs text-neutral-500">{clerkIdentity.email}</span>
+        ) : (
+          <button
+            type="button"
+            onClick={() => {
+              setMode(mode === 'signin' ? 'signup' : 'signin');
+              setError('');
+              setHintMessage('');
+            }}
+            className="text-sm font-medium text-neutral-700 dark:text-neutral-300 hover:underline cursor-pointer"
+          >
+            {mode === 'signin' ? 'Daftar Akaun' : 'Log Masuk'}
+          </button>
+        )}
       </div>
 
       {/* Centered Vercel Auth Card */}
@@ -361,7 +471,8 @@ export const AuthView: React.FC<AuthViewProps> = ({
           </div>
 
           {/* Mode Switch Tabs */}
-          <div className="grid grid-cols-2 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 mb-6">
+          {!clerkIdentity && (
+            <div className="grid grid-cols-2 p-1 rounded-lg bg-neutral-100 dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 mb-6">
             <button
               type="button"
               onClick={() => {
@@ -390,7 +501,8 @@ export const AuthView: React.FC<AuthViewProps> = ({
             >
               Daftar Baru (Sign Up)
             </button>
-          </div>
+            </div>
+          )}
 
           {error && (
             <div className="mb-4 p-3 rounded-lg border border-neutral-900 dark:border-neutral-200 bg-neutral-100 dark:bg-neutral-900 flex items-start gap-2.5 text-xs">
@@ -436,6 +548,7 @@ export const AuthView: React.FC<AuthViewProps> = ({
                   autoComplete="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
+                  readOnly={Boolean(clerkIdentity)}
                   placeholder="nama@syarikat.com"
                   className="w-full pl-9 pr-3 py-2.5 text-sm rounded-lg border border-neutral-300 dark:border-neutral-800 bg-white dark:bg-black focus:outline-none focus:border-black dark:focus:border-white transition-colors"
                 />
